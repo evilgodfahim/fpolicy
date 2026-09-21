@@ -15,7 +15,30 @@ from pathlib import Path
 
 import feedparser
 import requests
-from googlenewsdecoder import new_decoderv1 as gnewsdecoder
+
+# ---------------------------------------------------------------------------
+# Google News decoder compatibility
+#
+# New googlenewsdecoder >= 0.2.1:
+#     from googlenewsdecoder import gnewsdecoder
+#     result["success"] / result["decoded_url"]
+#
+# Older versions:
+#     from googlenewsdecoder import new_decoderv1
+#     result["status"] / result["decoded_url"]
+# ---------------------------------------------------------------------------
+
+try:
+    from googlenewsdecoder import gnewsdecoder
+    DECODER_API = "new"
+except ImportError:
+    try:
+        from googlenewsdecoder import new_decoderv1 as gnewsdecoder
+        DECODER_API = "old"
+    except ImportError:
+        gnewsdecoder = None
+        DECODER_API = None
+
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 FEED_URLS = [
@@ -33,14 +56,14 @@ FEED_URLS = [
     ),
 ]
 
-STATE_FILE  = "state/seen_guids.json"
-OUTPUT_FILE = "feed/geopolitics.xml"
-MAX_ITEMS   = 500
-MAX_SEEN    = 5000
-DECODE_DELAY = 0.3           # seconds between decoder calls
+STATE_FILE   = "state/seen_guids.json"
+OUTPUT_FILE  = "feed/geopolitics.xml"
+MAX_ITEMS    = 500
+MAX_SEEN     = 5000
+DECODE_DELAY = 0.3  # seconds between decoder calls
 
 FEED_TITLE = "Geopolitics & International Relations"
-FEED_DESC  = (
+FEED_DESC = (
     "Curated geopolitics, foreign policy, and international relations news "
     "with direct article URLs, decoded from Google News."
 )
@@ -56,7 +79,9 @@ HEADERS = {
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def now_rfc822() -> str:
-    return datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+    return datetime.now(timezone.utc).strftime(
+        "%a, %d %b %Y %H:%M:%S +0000"
+    )
 
 
 def strip_html(s: str) -> str:
@@ -64,53 +89,174 @@ def strip_html(s: str) -> str:
 
 
 def parse_pubdate(pub: str) -> datetime:
-    """Parse RFC 822 pubDate to timezone-aware datetime for sorting. Falls back to epoch."""
+    """Parse RFC 822 pubDate to timezone-aware datetime for sorting."""
     try:
-        return parsedate_to_datetime(pub)
+        dt = parsedate_to_datetime(pub)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone(timezone.utc)
+
     except Exception:
-        return datetime.fromtimestamp(0, tz=timezone.utc)
+        return datetime.fromtimestamp(
+            0,
+            tz=timezone.utc,
+        )
 
 
 # ── State ──────────────────────────────────────────────────────────────────────
 def load_seen(path: str) -> list:
     p = Path(path)
+
     if not p.exists():
         return []
+
     try:
-        return json.loads(p.read_text())
+        data = json.loads(
+            p.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        if isinstance(data, list):
+            return data
+
+        return []
+
     except Exception:
         return []
 
 
 def save_seen(path: str, seen: list):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(seen[-MAX_SEEN:]))
+    Path(path).parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    Path(path).write_text(
+        json.dumps(
+            seen[-MAX_SEEN:],
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 # ── URL Decoding ───────────────────────────────────────────────────────────────
 def decode_url(google_url: str) -> str:
     """
-    1. googlenewsdecoder (pure computation, no network).
+    1. googlenewsdecoder.
     2. HTTP redirect follow.
-    3. Return original if both fail.
+    3. Return original Google URL if both fail.
     """
-    try:
-        try:
-            result = gnewsdecoder(google_url, interval=0)
-        except TypeError:
-            result = gnewsdecoder(google_url)
-        url = (result or {}).get("decoded_url", "")
-        if url and url.startswith("http"):
-            return url
-    except Exception as e:
-        print(f"      [decoder error: {e}] trying redirect…")
 
+    if not google_url:
+        return google_url
+
+    # -----------------------------------------------------------------------
+    # Primary decoder
+    # -----------------------------------------------------------------------
+    if gnewsdecoder is not None:
+        try:
+            if DECODER_API == "new":
+                # Current googlenewsdecoder >= 0.2.1
+                result = gnewsdecoder(
+                    google_url,
+                    interval=0,
+                    timeout=15.0,
+                )
+
+                if (
+                    isinstance(result, dict)
+                    and result.get("success")
+                ):
+                    url = result.get(
+                        "decoded_url",
+                        "",
+                    )
+
+                    if (
+                        isinstance(url, str)
+                        and url.startswith("http")
+                    ):
+                        return url
+
+                else:
+                    message = (
+                        result.get("message", "")
+                        if isinstance(result, dict)
+                        else ""
+                    )
+
+                    if message:
+                        print(
+                            f"      [decoder: {message}] "
+                            "trying redirect…"
+                        )
+
+            else:
+                # Older googlenewsdecoder versions
+                try:
+                    result = gnewsdecoder(
+                        google_url,
+                        interval=0,
+                    )
+                except TypeError:
+                    result = gnewsdecoder(
+                        google_url
+                    )
+
+                if (
+                    isinstance(result, dict)
+                    and result.get("status")
+                ):
+                    url = result.get(
+                        "decoded_url",
+                        "",
+                    )
+
+                    if (
+                        isinstance(url, str)
+                        and url.startswith("http")
+                    ):
+                        return url
+
+        except Exception as e:
+            print(
+                f"      [decoder error: {e}] "
+                "trying redirect…"
+            )
+
+    else:
+        print(
+            "      [decoder unavailable] "
+            "trying redirect…"
+        )
+
+    # -----------------------------------------------------------------------
+    # Fallback: follow HTTP redirects
+    # -----------------------------------------------------------------------
     try:
-        r = requests.get(google_url, allow_redirects=True, headers=HEADERS, timeout=15)
-        if r.url and r.url.startswith("http") and "google.com" not in r.url:
+        r = requests.get(
+            google_url,
+            allow_redirects=True,
+            headers=HEADERS,
+            timeout=15,
+        )
+
+        if (
+            r.url
+            and r.url.startswith("http")
+            and "google.com" not in r.url
+        ):
             return r.url
+
     except Exception as e:
-        print(f"      [redirect error: {e}]")
+        print(
+            f"      [redirect error: {e}]"
+        )
 
     return google_url
 
@@ -119,82 +265,222 @@ def decode_url(google_url: str) -> str:
 def load_existing(path: str) -> list[dict]:
     if not Path(path).exists():
         return []
+
     try:
         root = ET.parse(path).getroot()
         ch = root.find("channel")
+
         if ch is None:
             return []
+
         return [
             {
-                "title":   it.findtext("title", ""),
-                "link":    it.findtext("link", ""),
-                "desc":    it.findtext("description", ""),
-                "pubDate": it.findtext("pubDate", ""),
+                "title": it.findtext(
+                    "title",
+                    "",
+                ),
+                "link": it.findtext(
+                    "link",
+                    "",
+                ),
+                "desc": it.findtext(
+                    "description",
+                    "",
+                ),
+                "pubDate": it.findtext(
+                    "pubDate",
+                    "",
+                ),
             }
             for it in ch.findall("item")
         ]
+
     except Exception as e:
-        print(f"[load_existing error: {e}]")
+        print(
+            f"[load_existing error: {e}]"
+        )
         return []
 
 
-def write_rss(items: list[dict], path: str):
-    rss = ET.Element("rss", attrib={"version": "2.0"})
-    ch  = ET.SubElement(rss, "channel")
+def write_rss(
+    items: list[dict],
+    path: str,
+):
+    rss = ET.Element(
+        "rss",
+        attrib={
+            "version": "2.0"
+        },
+    )
 
-    ET.SubElement(ch, "title").text        = FEED_TITLE
-    ET.SubElement(ch, "link").text         = FEED_LINK
-    ET.SubElement(ch, "description").text  = FEED_DESC
-    ET.SubElement(ch, "language").text     = "en-US"
-    ET.SubElement(ch, "lastBuildDate").text = now_rfc822()
+    ch = ET.SubElement(
+        rss,
+        "channel",
+    )
+
+    ET.SubElement(
+        ch,
+        "title",
+    ).text = FEED_TITLE
+
+    ET.SubElement(
+        ch,
+        "link",
+    ).text = FEED_LINK
+
+    ET.SubElement(
+        ch,
+        "description",
+    ).text = FEED_DESC
+
+    ET.SubElement(
+        ch,
+        "language",
+    ).text = "en-US"
+
+    ET.SubElement(
+        ch,
+        "lastBuildDate",
+    ).text = now_rfc822()
 
     for d in items:
-        it = ET.SubElement(ch, "item")
-        ET.SubElement(it, "title").text       = d["title"]
-        ET.SubElement(it, "link").text        = d["link"]
-        ET.SubElement(it, "description").text = d["desc"]
-        ET.SubElement(it, "pubDate").text     = d["pubDate"]
-        g = ET.SubElement(it, "guid")
-        g.set("isPermaLink", "true")
+        it = ET.SubElement(
+            ch,
+            "item",
+        )
+
+        ET.SubElement(
+            it,
+            "title",
+        ).text = d["title"]
+
+        ET.SubElement(
+            it,
+            "link",
+        ).text = d["link"]
+
+        ET.SubElement(
+            it,
+            "description",
+        ).text = d["desc"]
+
+        ET.SubElement(
+            it,
+            "pubDate",
+        ).text = d["pubDate"]
+
+        g = ET.SubElement(
+            it,
+            "guid",
+        )
+
+        g.set(
+            "isPermaLink",
+            "true",
+        )
+
         g.text = d["link"]
 
-    ET.indent(rss, space="  ")
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    ET.indent(
+        rss,
+        space="  ",
+    )
+
+    Path(path).parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     Path(path).write_text(
         '<?xml version="1.0" encoding="UTF-8"?>\n'
-        + ET.tostring(rss, encoding="unicode"),
+        + ET.tostring(
+            rss,
+            encoding="unicode",
+        ),
         encoding="utf-8",
     )
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    seen_list = load_seen(STATE_FILE)
-    seen_set  = set(seen_list)
-    existing  = load_existing(OUTPUT_FILE)
+    seen_list = load_seen(
+        STATE_FILE
+    )
 
-    print(f"Known GUIDs : {len(seen_set)}")
-    print(f"Existing    : {len(existing)} items in feed")
+    seen_set = set(
+        seen_list
+    )
+
+    existing = load_existing(
+        OUTPUT_FILE
+    )
+
+    print(
+        f"Known GUIDs : {len(seen_set)}"
+    )
+
+    print(
+        f"Existing    : {len(existing)} items in feed"
+    )
 
     # ── Fetch all feeds, deduplicate entries by GUID across feeds ──────────────
-    all_entries: list[tuple[str, object]] = []   # (guid, entry)
+    all_entries: list[
+        tuple[str, object]
+    ] = []
+
     seen_this_run: set[str] = set()
 
-    for i, url in enumerate(FEED_URLS, 1):
-        print(f"\nFeed {i}/{len(FEED_URLS)}: {url[:80]}…")
-        feed = feedparser.parse(url)
-        if feed.bozo and not feed.entries:
-            print(f"  [fetch failed: {feed.bozo_exception}]")
-            continue
-        print(f"  Entries: {len(feed.entries)}")
-        for entry in feed.entries:
-            guid = entry.get("id", "")
-            if not guid or guid in seen_this_run:
-                continue
-            seen_this_run.add(guid)
-            all_entries.append((guid, entry))
+    for i, url in enumerate(
+        FEED_URLS,
+        1,
+    ):
+        print(
+            f"\nFeed {i}/{len(FEED_URLS)}: "
+            f"{url[:80]}…"
+        )
 
-    print(f"\nUnique entries across feeds: {len(all_entries)}")
+        feed = feedparser.parse(
+            url
+        )
+
+        if feed.bozo and not feed.entries:
+            print(
+                f"  [fetch failed: "
+                f"{feed.bozo_exception}]"
+            )
+            continue
+
+        print(
+            f"  Entries: {len(feed.entries)}"
+        )
+
+        for entry in feed.entries:
+            guid = entry.get(
+                "id",
+                "",
+            )
+
+            if (
+                not guid
+                or guid in seen_this_run
+            ):
+                continue
+
+            seen_this_run.add(
+                guid
+            )
+
+            all_entries.append(
+                (
+                    guid,
+                    entry,
+                )
+            )
+
+    print(
+        f"\nUnique entries across feeds: "
+        f"{len(all_entries)}"
+    )
 
     # ── Decode new entries ─────────────────────────────────────────────────────
     new_items: list[dict] = []
@@ -203,35 +489,113 @@ def main():
         if guid in seen_set:
             continue
 
-        title   = entry.get("title", "No title")
-        raw_url = entry.get("link", "")
-        desc    = strip_html(entry.get("summary", title))
-        pub     = entry.get("published", now_rfc822())
+        title = entry.get(
+            "title",
+            "No title",
+        )
 
-        print(f"  + {title[:80]}")
-        direct_url = decode_url(raw_url)
+        raw_url = entry.get(
+            "link",
+            "",
+        )
 
-        new_items.append({"title": title, "link": direct_url, "desc": desc, "pubDate": pub})
-        seen_list.append(guid)
-        seen_set.add(guid)
-        time.sleep(DECODE_DELAY)
+        desc = strip_html(
+            entry.get(
+                "summary",
+                title,
+            )
+        )
 
-    print(f"\nNew items   : {len(new_items)}")
+        pub = entry.get(
+            "published",
+            now_rfc822(),
+        )
+
+        # Ensure missing/invalid pubDate does not break XML generation.
+        if not pub:
+            pub = now_rfc822()
+
+        print(
+            f"  + {title[:80]}"
+        )
+
+        direct_url = decode_url(
+            raw_url
+        )
+
+        new_items.append(
+            {
+                "title": title,
+                "link": direct_url,
+                "desc": desc,
+                "pubDate": pub,
+            }
+        )
+
+        seen_list.append(
+            guid
+        )
+
+        seen_set.add(
+            guid
+        )
+
+        time.sleep(
+            DECODE_DELAY
+        )
+
+    print(
+        f"\nNew items   : {len(new_items)}"
+    )
 
     # ── Dedup existing by link (handles URL collisions across runs) ────────────
-    existing_links = {d["link"] for d in new_items}
-    deduped_existing = [d for d in existing if d["link"] not in existing_links]
+    existing_links = {
+        d["link"]
+        for d in new_items
+        if d.get("link")
+    }
+
+    deduped_existing = [
+        d
+        for d in existing
+        if d["link"] not in existing_links
+    ]
 
     # ── Merge and sort by pubDate descending ───────────────────────────────────
-    combined = new_items + deduped_existing
-    combined.sort(key=lambda d: parse_pubdate(d["pubDate"]), reverse=True)
-    final = combined[:MAX_ITEMS]
+    combined = (
+        new_items
+        + deduped_existing
+    )
 
-    write_rss(final, OUTPUT_FILE)
-    print(f"Output      : {len(final)} items → {OUTPUT_FILE}")
+    combined.sort(
+        key=lambda d: parse_pubdate(
+            d["pubDate"]
+        ),
+        reverse=True,
+    )
 
-    save_seen(STATE_FILE, seen_list)
-    print("State saved.")
+    final = combined[
+        :MAX_ITEMS
+    ]
+
+    write_rss(
+        final,
+        OUTPUT_FILE,
+    )
+
+    print(
+        f"Output      : {len(final)} "
+        f"items → {OUTPUT_FILE}"
+    )
+
+    save_seen(
+        STATE_FILE,
+        seen_list,
+    )
+
+    print(
+        "State saved."
+    )
 
 
 if __name__ == "__main__":
